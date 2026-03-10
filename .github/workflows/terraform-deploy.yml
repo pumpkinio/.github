@@ -89,15 +89,13 @@ jobs:
 
       - name: Create Lambda placeholder zips
         run: |
-          # Terraform Lambda resources reference placeholder zip files for initial deploy.
-          # After first deploy, lifecycle ignore_changes prevents re-upload.
-          # Create minimal valid zips so terraform validate/plan succeed.
-          for dir in $(find "${{ github.workspace }}" -path '*/modules/lambda' -type d); do
-            echo "exports.handler = async () => ({ statusCode: 200 });" > /tmp/index.js
-            (cd /tmp && zip -j "$dir/lambda-placeholder.zip" index.js)
-            (cd /tmp && zip -j "$dir/lambda-layer-placeholder.zip" index.js)
-            echo "Created placeholder zips in $dir"
-          done
+          # Terraform resolves filebase64sha256() relative to the root module (working-directory).
+          # Create placeholder zips here so terraform validate/plan succeed.
+          echo "exports.handler = async () => ({ statusCode: 200 });" > /tmp/index.js
+          (cd /tmp && zip -j lambda-placeholder.zip index.js && zip -j lambda-layer-placeholder.zip index.js)
+          cp /tmp/lambda-placeholder.zip .
+          cp /tmp/lambda-layer-placeholder.zip .
+          echo "Created placeholder zips in $(pwd)"
 
       - name: Terraform Init
         run: terraform init -input=false
