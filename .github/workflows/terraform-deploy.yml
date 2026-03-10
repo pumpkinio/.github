@@ -80,10 +80,12 @@ jobs:
           terraform_wrapper: true
 
       - name: Write sensitive variables
-        if: ${{ secrets.tf-sensitive-vars != '' }}
         env:
           TF_SENSITIVE_VARS: ${{ secrets.tf-sensitive-vars }}
-        run: printf '%s\n' "$TF_SENSITIVE_VARS" > .sensitive.auto.tfvars
+        run: |
+          if [ -n "$TF_SENSITIVE_VARS" ]; then
+            printf '%s\n' "$TF_SENSITIVE_VARS" > .sensitive.auto.tfvars
+          fi
 
       - name: Create Lambda placeholder zips
         run: |
