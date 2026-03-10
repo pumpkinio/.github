@@ -35,6 +35,9 @@ on:
       aws-role-arn:
         description: 'IAM Role ARN to assume via OIDC'
         required: true
+      tf-sensitive-vars:
+        description: 'HCL-formatted sensitive variables (written to .sensitive.auto.tfvars before plan)'
+        required: false
     outputs:
       plan-has-changes:
         description: 'true if the plan contains infrastructure changes'
@@ -75,6 +78,24 @@ jobs:
         with:
           terraform_version: ${{ inputs.terraform-version }}
           terraform_wrapper: true
+
+      - name: Write sensitive variables
+        if: ${{ secrets.tf-sensitive-vars != '' }}
+        env:
+          TF_SENSITIVE_VARS: ${{ secrets.tf-sensitive-vars }}
+        run: printf '%s\n' "$TF_SENSITIVE_VARS" > .sensitive.auto.tfvars
+
+      - name: Create Lambda placeholder zips
+        run: |
+          # Terraform Lambda resources reference placeholder zip files for initial deploy.
+          # After first deploy, lifecycle ignore_changes prevents re-upload.
+          # Create minimal valid zips so terraform validate/plan succeed.
+          for dir in $(find "${{ github.workspace }}" -path '*/modules/lambda' -type d); do
+            echo "exports.handler = async () => ({ statusCode: 200 });" > /tmp/index.js
+            (cd /tmp && zip -j "$dir/lambda-placeholder.zip" index.js)
+            (cd /tmp && zip -j "$dir/lambda-layer-placeholder.zip" index.js)
+            echo "Created placeholder zips in $dir"
+          done
 
       - name: Terraform Init
         run: terraform init -input=false
