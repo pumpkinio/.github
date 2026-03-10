@@ -1,0 +1,64 @@
+name: Zip Lambda Handler
+description: >
+  Packages a Lambda handler directory and the shared modules directory into a
+  deployment-ready zip file. Handler .js files are placed at the zip root;
+  the shared/ directory is included as a subdirectory.
+  Output zip is named after the handler directory basename.
+
+inputs:
+  handler-dir:
+    description: Path to the Lambda handler directory (e.g. services/api/verify-deposit)
+    required: true
+  shared-dir:
+    description: Path to the shared modules directory (e.g. services/api/shared)
+    required: true
+  output-dir:
+    description: Directory in which to write the zip file
+    required: false
+    default: ./dist
+
+outputs:
+  zip-path:
+    description: Absolute path to the produced zip file
+    value: ${{ steps.zip.outputs.zip-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Create output directory
+      shell: bash
+      run: mkdir -p "${{ inputs.output-dir }}"
+
+    - name: Build zip archive
+      id: zip
+      shell: bash
+      run: |
+        HANDLER_DIR="${{ inputs.handler-dir }}"
+        SHARED_DIR="${{ inputs.shared-dir }}"
+        OUTPUT_DIR="${{ inputs.output-dir }}"
+
+        # Derive zip name from the handler directory basename
+        HANDLER_NAME="$(basename "${HANDLER_DIR}")"
+        ZIP_NAME="${HANDLER_NAME}.zip"
+        ZIP_PATH="$(realpath "${OUTPUT_DIR}")/${ZIP_NAME}"
+
+        echo "Packaging Lambda: ${HANDLER_NAME}"
+        echo "  handler-dir : ${HANDLER_DIR}"
+        echo "  shared-dir  : ${SHARED_DIR}"
+        echo "  output      : ${ZIP_PATH}"
+
+        # Build in a staging directory so zip structure is predictable
+        STAGING_DIR="$(mktemp -d)"
+        trap 'rm -rf "${STAGING_DIR}"' EXIT
+
+        # Copy handler .js files to staging root
+        find "${HANDLER_DIR}" -maxdepth 1 -name '*.js' -exec cp {} "${STAGING_DIR}/" \;
+
+        # Copy shared directory as a subdirectory called 'shared'
+        cp -r "${SHARED_DIR}" "${STAGING_DIR}/shared"
+
+        # Create the zip from inside the staging dir so paths are relative
+        (cd "${STAGING_DIR}" && zip -r "${ZIP_PATH}" .)
+
+        echo "zip-path=${ZIP_PATH}" >> "${GITHUB_OUTPUT}"
+        echo "Created ${ZIP_PATH} ($(du -sh "${ZIP_PATH}" | cut -f1))"

@@ -1,0 +1,72 @@
+name: Node.js CI (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node.js version to use'
+        type: string
+        default: '20'
+      working-directory:
+        description: 'Working directory for all commands'
+        type: string
+        default: '.'
+      test-command:
+        description: 'Command to run tests'
+        type: string
+        default: 'npm test'
+      lint-command:
+        description: 'Command to run linter'
+        type: string
+        default: 'npm run lint'
+      install-command:
+        description: 'Command to install dependencies'
+        type: string
+        default: 'npm ci'
+      typecheck-command:
+        description: 'Command to run type checking (skipped if empty)'
+        type: string
+        default: ''
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Run lint
+        run: ${{ inputs.lint-command }}
+
+      - name: Run type checking
+        if: ${{ inputs.typecheck-command != '' }}
+        run: ${{ inputs.typecheck-command }}
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            ${{ inputs.working-directory }}/coverage/
+            ${{ inputs.working-directory }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 14

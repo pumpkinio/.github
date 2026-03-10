@@ -1,0 +1,28 @@
+name: Configure AWS Credentials via OIDC
+description: >
+  Authenticates to AWS using OIDC (no long-lived access keys).
+  The calling job MUST declare: permissions: id-token: write (and contents: read).
+  Uses aws-actions/configure-aws-credentials with role assumption.
+
+inputs:
+  role-arn:
+    description: ARN of the IAM role to assume via OIDC
+    required: true
+  aws-region:
+    description: AWS region to configure
+    required: false
+    default: us-east-1
+  session-name:
+    description: Name for the assumed-role session (visible in CloudTrail)
+    required: false
+    default: github-actions
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: ${{ inputs.session-name }}

@@ -1,0 +1,182 @@
+name: Database Migrations
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment (dev or prod)'
+        type: string
+        required: true
+      aws-region:
+        description: 'AWS region'
+        type: string
+        required: false
+        default: 'us-east-1'
+      migrations-directory:
+        description: 'Path to directory containing migration .sql files'
+        type: string
+        required: false
+        default: 'database/migrations'
+      schema-file:
+        description: 'Path to initial schema SQL file'
+        type: string
+        required: false
+        default: 'database/schema.sql'
+    secrets:
+      aws-role-arn:
+        description: 'IAM Role ARN to assume via OIDC'
+        required: true
+      database-cluster-arn:
+        description: 'Aurora cluster ARN for rds-data execute-statement'
+        required: true
+      database-secret-arn:
+        description: 'Secrets Manager ARN holding DB credentials'
+        required: true
+      database-name:
+        description: 'Database name (e.g. pumpkin_trading)'
+        required: true
+
+jobs:
+  migrate:
+    name: Run Migrations (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # ── Bootstrap: ensure schema_migrations tracking table exists ──────────
+      - name: Check if schema_migrations table exists
+        id: check-table
+        run: |
+          RESULT=$(aws rds-data execute-statement \
+            --resource-arn "${{ secrets.database-cluster-arn }}" \
+            --secret-arn   "${{ secrets.database-secret-arn }}" \
+            --database     "${{ secrets.database-name }}" \
+            --sql "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'schema_migrations')" \
+            --query 'records[0][0].booleanValue' \
+            --output text)
+          echo "table-exists=${RESULT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create schema_migrations table if missing
+        if: steps.check-table.outputs.table-exists != 'true'
+        run: |
+          echo "schema_migrations table not found — creating..."
+          aws rds-data execute-statement \
+            --resource-arn "${{ secrets.database-cluster-arn }}" \
+            --secret-arn   "${{ secrets.database-secret-arn }}" \
+            --database     "${{ secrets.database-name }}" \
+            --sql "CREATE TABLE IF NOT EXISTS schema_migrations (
+                     version    TEXT        PRIMARY KEY,
+                     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                   )"
+          echo "schema_migrations table created."
+
+      # ── Run migrations ──────────────────────────────────────────────────────
+      - name: Run pending migrations
+        id: run-migrations
+        run: |
+          MIGRATIONS_DIR="${{ inputs.migrations-directory }}"
+          CLUSTER_ARN="${{ secrets.database-cluster-arn }}"
+          SECRET_ARN="${{ secrets.database-secret-arn }}"
+          DB_NAME="${{ secrets.database-name }}"
+
+          if [ ! -d "${MIGRATIONS_DIR}" ]; then
+            echo "Migrations directory '${MIGRATIONS_DIR}' not found — nothing to run."
+            echo "applied-count=0"  >> "$GITHUB_OUTPUT"
+            echo "applied-versions=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          APPLIED_COUNT=0
+          APPLIED_VERSIONS=""
+
+          # Iterate over .sql files sorted lexicographically (filename order = version order)
+          while IFS= read -r -d '' MIGRATION_FILE; do
+            FILENAME=$(basename "${MIGRATION_FILE}")
+
+            # Extract version prefix: everything up to the first non-digit character
+            # e.g. "002-rate-limit-entries.sql" -> "002"
+            VERSION=$(echo "${FILENAME}" | grep -oE '^[0-9]+')
+
+            if [ -z "${VERSION}" ]; then
+              echo "⚠️  Skipping '${FILENAME}': cannot determine version number."
+              continue
+            fi
+
+            echo "──────────────────────────────────────────"
+            echo "Migration: ${FILENAME}  (version=${VERSION})"
+
+            # Check whether this version has already been applied
+            EXISTING=$(aws rds-data execute-statement \
+              --resource-arn "${CLUSTER_ARN}" \
+              --secret-arn   "${SECRET_ARN}" \
+              --database     "${DB_NAME}" \
+              --sql          "SELECT version FROM schema_migrations WHERE version = :version" \
+              --parameters   "[{\"name\":\"version\",\"value\":{\"stringValue\":\"${VERSION}\"}}]" \
+              --query        'records[0][0].stringValue' \
+              --output       text 2>/dev/null || true)
+
+            if [ "${EXISTING}" = "${VERSION}" ]; then
+              echo "✓ Already applied — skipping."
+              continue
+            fi
+
+            echo "→ Applying migration..."
+
+            SQL_CONTENT=$(cat "${MIGRATION_FILE}")
+
+            # Execute the migration via Aurora Data API
+            if ! aws rds-data execute-statement \
+                --resource-arn "${CLUSTER_ARN}" \
+                --secret-arn   "${SECRET_ARN}" \
+                --database     "${DB_NAME}" \
+                --sql          "${SQL_CONTENT}"; then
+              echo "✗ Migration '${FILENAME}' FAILED. Aborting."
+              exit 1
+            fi
+
+            # Record the applied version
+            aws rds-data execute-statement \
+              --resource-arn "${CLUSTER_ARN}" \
+              --secret-arn   "${SECRET_ARN}" \
+              --database     "${DB_NAME}" \
+              --sql          "INSERT INTO schema_migrations (version) VALUES (:version)" \
+              --parameters   "[{\"name\":\"version\",\"value\":{\"stringValue\":\"${VERSION}\"}}]"
+
+            echo "✓ Migration '${FILENAME}' applied successfully."
+            APPLIED_COUNT=$((APPLIED_COUNT + 1))
+            APPLIED_VERSIONS="${APPLIED_VERSIONS} ${VERSION}"
+
+          done < <(find "${MIGRATIONS_DIR}" -maxdepth 1 -name '*.sql' -print0 | sort -z)
+
+          echo ""
+          echo "═══════════════════════════════════════════"
+          echo "Migrations complete."
+          echo "  Applied : ${APPLIED_COUNT}"
+          echo "  Versions: ${APPLIED_VERSIONS:-none}"
+          echo "═══════════════════════════════════════════"
+
+          echo "applied-count=${APPLIED_COUNT}"    >> "$GITHUB_OUTPUT"
+          echo "applied-versions=${APPLIED_VERSIONS}" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise migration run
+        if: always()
+        run: |
+          echo "### Database Migration Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | ----- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Environment | \`${{ inputs.environment }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Migrations applied | ${{ steps.run-migrations.outputs.applied-count }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Applied versions | \`${{ steps.run-migrations.outputs.applied-versions }}\` |" >> "$GITHUB_STEP_SUMMARY"

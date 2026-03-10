@@ -1,0 +1,223 @@
+name: Deploy Lambda Functions
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment (dev or prod)'
+        type: string
+        required: true
+      aws-region:
+        description: 'AWS region'
+        type: string
+        default: 'us-east-1'
+      functions-directory:
+        description: 'Path to the directory containing Lambda function subdirectories'
+        type: string
+        required: true
+      shared-directory:
+        description: 'Path to the shared modules directory'
+        type: string
+        default: 'services/api/shared'
+      function-prefix:
+        description: 'Prefix for Lambda function names (e.g., pumpkin-dev- or pumpkin-prod-)'
+        type: string
+        required: true
+      node-version:
+        description: 'Node.js version to use'
+        type: string
+        default: '20'
+      exclude-dirs:
+        description: 'Comma-separated list of subdirectory names to skip'
+        type: string
+        default: 'shared,__tests__,node_modules'
+    secrets:
+      aws-role-arn:
+        description: 'ARN of the IAM role to assume via OIDC'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Lambda Functions (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Discover and deploy Lambda functions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FUNCTIONS_DIR="${{ inputs.functions-directory }}"
+          SHARED_DIR="${{ inputs.shared-directory }}"
+          FUNCTION_PREFIX="${{ inputs.function-prefix }}"
+          EXCLUDE_DIRS="${{ inputs.exclude-dirs }}"
+
+          # Build exclusion array
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
+          declare -A EXCLUDE_MAP
+          for dir in "${EXCLUDE_ARRAY[@]}"; do
+            trimmed="$(echo "$dir" | xargs)"
+            EXCLUDE_MAP["$trimmed"]=1
+          done
+
+          # Collect function directories
+          FUNCTION_DIRS=()
+          while IFS= read -r -d '' entry; do
+            dirname="$(basename "$entry")"
+            if [[ -z "${EXCLUDE_MAP[$dirname]+_}" ]]; then
+              FUNCTION_DIRS+=("$entry")
+            fi
+          done < <(find "$FUNCTIONS_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+
+          if [[ ${#FUNCTION_DIRS[@]} -eq 0 ]]; then
+            echo "::error::No function directories found in $FUNCTIONS_DIR"
+            exit 1
+          fi
+
+          echo "Discovered ${#FUNCTION_DIRS[@]} function(s) to deploy:"
+          for fn_dir in "${FUNCTION_DIRS[@]}"; do
+            echo "  - $(basename "$fn_dir")"
+          done
+
+          # Track failures
+          FAILED_FUNCTIONS=()
+          DEPLOYED_FUNCTIONS=()
+
+          WORK_DIR="$(mktemp -d)"
+          trap 'rm -rf "$WORK_DIR"' EXIT
+
+          for fn_dir in "${FUNCTION_DIRS[@]}"; do
+            fn_name="$(basename "$fn_dir")"
+            lambda_name="${FUNCTION_PREFIX}${fn_name}"
+            build_dir="$WORK_DIR/$fn_name"
+            zip_path="$WORK_DIR/${fn_name}.zip"
+
+            echo ""
+            echo "=========================================="
+            echo "Deploying: $lambda_name"
+            echo "=========================================="
+            START_TIME=$(date +%s)
+
+            (
+              set -euo pipefail
+
+              mkdir -p "$build_dir"
+
+              # Copy handler .js files from function directory
+              if compgen -G "$fn_dir/*.js" > /dev/null 2>&1; then
+                cp "$fn_dir"/*.js "$build_dir/"
+              else
+                echo "::warning::No .js handler files found in $fn_dir"
+              fi
+
+              # Copy shared directory into build dir
+              if [[ -d "$SHARED_DIR" ]]; then
+                cp -r "$SHARED_DIR" "$build_dir/shared"
+              else
+                echo "::warning::Shared directory not found at $SHARED_DIR — skipping"
+              fi
+
+              # Copy package.json: prefer function-local, fall back to root
+              if [[ -f "$fn_dir/package.json" ]]; then
+                cp "$fn_dir/package.json" "$build_dir/package.json"
+              elif [[ -f "package.json" ]]; then
+                cp "package.json" "$build_dir/package.json"
+              fi
+
+              # Copy node_modules: prefer function-local, fall back to root
+              if [[ -d "$fn_dir/node_modules" ]]; then
+                cp -r "$fn_dir/node_modules" "$build_dir/node_modules"
+              elif [[ -d "node_modules" ]]; then
+                cp -r "node_modules" "$build_dir/node_modules"
+              fi
+
+              # Package into zip
+              (cd "$build_dir" && zip -qr "$zip_path" .)
+
+              ZIP_SIZE=$(du -sh "$zip_path" | cut -f1)
+              echo "Package size: $ZIP_SIZE"
+
+              # Deploy to Lambda
+              echo "Uploading code to Lambda..."
+              aws lambda update-function-code \
+                --function-name "$lambda_name" \
+                --zip-file "fileb://$zip_path" \
+                --region "${{ inputs.aws-region }}" \
+                --output json \
+                | jq -r '"  CodeSize: \(.CodeSize) bytes | Runtime: \(.Runtime) | LastModified: \(.LastModified)"'
+
+              # Wait for update to propagate
+              echo "Waiting for function update to complete..."
+              aws lambda wait function-updated \
+                --function-name "$lambda_name" \
+                --region "${{ inputs.aws-region }}"
+
+              # Retrieve and print the published version info
+              FUNC_INFO=$(aws lambda get-function-configuration \
+                --function-name "$lambda_name" \
+                --region "${{ inputs.aws-region }}" \
+                --output json)
+              FUNC_VERSION=$(echo "$FUNC_INFO" | jq -r '.Version')
+              FUNC_STATE=$(echo "$FUNC_INFO"   | jq -r '.State')
+              echo "  Version: $FUNC_VERSION | State: $FUNC_STATE"
+
+            ) && DEPLOY_OK=true || DEPLOY_OK=false
+
+            END_TIME=$(date +%s)
+            ELAPSED=$((END_TIME - START_TIME))
+
+            if [[ "$DEPLOY_OK" == "true" ]]; then
+              echo "OK $lambda_name deployed in ${ELAPSED}s"
+              DEPLOYED_FUNCTIONS+=("$lambda_name")
+            else
+              echo "::error::FAILED to deploy $lambda_name (after ${ELAPSED}s)"
+              FAILED_FUNCTIONS+=("$lambda_name")
+            fi
+          done
+
+          # Summary
+          echo ""
+          echo "=========================================="
+          echo "Deployment Summary"
+          echo "=========================================="
+          echo "Succeeded (${#DEPLOYED_FUNCTIONS[@]}):"
+          for fn in "${DEPLOYED_FUNCTIONS[@]}"; do
+            echo "  [OK] $fn"
+          done
+
+          if [[ ${#FAILED_FUNCTIONS[@]} -gt 0 ]]; then
+            echo ""
+            echo "Failed (${#FAILED_FUNCTIONS[@]}):"
+            for fn in "${FAILED_FUNCTIONS[@]}"; do
+              echo "  [FAIL] $fn"
+            done
+            echo ""
+            echo "::error::${#FAILED_FUNCTIONS[@]} function(s) failed to deploy. See above for details."
+            exit 1
+          else
+            echo ""
+            echo "All ${#DEPLOYED_FUNCTIONS[@]} function(s) deployed successfully."
+          fi

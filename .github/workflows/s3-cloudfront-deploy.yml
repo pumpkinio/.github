@@ -1,0 +1,203 @@
+name: Deploy Frontend to S3 + CloudFront
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment (dev or prod)'
+        type: string
+        required: true
+      aws-region:
+        description: 'AWS region'
+        type: string
+        default: 'us-east-1'
+      working-directory:
+        description: 'Directory containing the frontend project'
+        type: string
+        default: '.'
+      build-command:
+        description: 'Command to build the frontend'
+        type: string
+        default: 'npm run build'
+      build-output:
+        description: 'Directory produced by the build command (relative to working-directory)'
+        type: string
+        default: 'dist'
+      node-version:
+        description: 'Node.js version to use'
+        type: string
+        default: '20'
+      install-command:
+        description: 'Command to install dependencies'
+        type: string
+        default: 'npm ci'
+    secrets:
+      aws-role-arn:
+        description: 'ARN of the IAM role to assume via OIDC'
+        required: true
+      s3-bucket:
+        description: 'S3 bucket name (without s3:// prefix)'
+        required: true
+      cloudfront-distribution-id:
+        description: 'CloudFront distribution ID'
+        required: true
+      env-vars:
+        description: 'Optional JSON string of VITE_* environment variables to inject at build time, e.g. {"VITE_API_URL":"https://api.example.com"}'
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Frontend (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    outputs:
+      cloudfront-url: ${{ steps.cf-url.outputs.url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.install-command }}
+
+      - name: Inject build-time environment variables
+        if: ${{ secrets.env-vars != '' }}
+        shell: bash
+        run: |
+          # Parse the JSON string and export each key=value pair for subsequent steps.
+          # Supports string values only; numbers/booleans are converted to strings automatically.
+          ENV_JSON='${{ secrets.env-vars }}'
+          if [[ -z "$ENV_JSON" ]]; then
+            echo "No env-vars provided — skipping."
+            exit 0
+          fi
+
+          echo "Exporting VITE_* environment variables from env-vars secret..."
+          while IFS='=' read -r key value; do
+            # Write to $GITHUB_ENV so the value is available in all subsequent steps
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+            echo "  Exported: $key"
+          done < <(echo "$ENV_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+
+      - name: Build frontend
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.build-command }}
+
+      - name: Verify build output exists
+        shell: bash
+        run: |
+          BUILD_PATH="${{ inputs.working-directory }}/${{ inputs.build-output }}"
+          if [[ ! -d "$BUILD_PATH" ]]; then
+            echo "::error::Build output directory '$BUILD_PATH' not found. Check build-output input."
+            exit 1
+          fi
+          FILE_COUNT=$(find "$BUILD_PATH" -type f | wc -l | xargs)
+          echo "Build output contains $FILE_COUNT file(s) in $BUILD_PATH"
+
+      - name: Sync hashed assets to S3 (long-lived cache)
+        shell: bash
+        run: |
+          BUILD_PATH="${{ inputs.working-directory }}/${{ inputs.build-output }}"
+          BUCKET="${{ secrets.s3-bucket }}"
+
+          echo "Syncing hashed assets (js, css, images) with immutable cache headers..."
+          aws s3 sync "$BUILD_PATH/assets" "s3://$BUCKET/assets" \
+            --region "${{ inputs.aws-region }}" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --delete \
+            --no-progress
+
+          echo "Hashed assets sync complete."
+
+      - name: Sync root files to S3 (no-cache)
+        shell: bash
+        run: |
+          BUILD_PATH="${{ inputs.working-directory }}/${{ inputs.build-output }}"
+          BUCKET="${{ secrets.s3-bucket }}"
+
+          echo "Syncing root files (index.html, etc.) with no-cache headers..."
+          # Sync everything except the assets/ subdirectory
+          aws s3 sync "$BUILD_PATH" "s3://$BUCKET" \
+            --region "${{ inputs.aws-region }}" \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --exclude "assets/*" \
+            --delete \
+            --no-progress
+
+          echo "Root files sync complete."
+
+      - name: Invalidate CloudFront cache
+        id: invalidate
+        shell: bash
+        run: |
+          DISTRIBUTION_ID="${{ secrets.cloudfront-distribution-id }}"
+
+          echo "Creating CloudFront invalidation for / and /index.html..."
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/index.html" "/" \
+            --query 'Invalidation.Id' \
+            --output text)
+
+          echo "Invalidation ID: $INVALIDATION_ID"
+          echo "invalidation-id=$INVALIDATION_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CloudFront invalidation to complete
+        shell: bash
+        run: |
+          DISTRIBUTION_ID="${{ secrets.cloudfront-distribution-id }}"
+          INVALIDATION_ID="${{ steps.invalidate.outputs.invalidation-id }}"
+
+          echo "Waiting for invalidation $INVALIDATION_ID to complete..."
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --id "$INVALIDATION_ID"
+
+          echo "CloudFront invalidation completed."
+
+      - name: Resolve CloudFront distribution URL
+        id: cf-url
+        shell: bash
+        run: |
+          DISTRIBUTION_ID="${{ secrets.cloudfront-distribution-id }}"
+
+          DOMAIN=$(aws cloudfront get-distribution \
+            --id "$DISTRIBUTION_ID" \
+            --query 'Distribution.DomainName' \
+            --output text)
+
+          URL="https://$DOMAIN"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Deployment live at: $URL"
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "Frontend Deployment Summary"
+          echo "=========================================="
+          echo "  Environment : ${{ inputs.environment }}"
+          echo "  S3 Bucket   : ${{ secrets.s3-bucket }}"
+          echo "  Region      : ${{ inputs.aws-region }}"
+          echo "  CF Dist ID  : ${{ secrets.cloudfront-distribution-id }}"
+          echo "  Live URL    : ${{ steps.cf-url.outputs.url }}"
+          echo "=========================================="

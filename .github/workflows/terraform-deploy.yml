@@ -1,0 +1,140 @@
+name: Terraform Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment (dev or prod)'
+        type: string
+        required: true
+      working-directory:
+        description: 'Terraform root module directory (e.g. terraform/dev)'
+        type: string
+        required: true
+      terraform-version:
+        description: 'Terraform CLI version to install'
+        type: string
+        required: false
+        default: '1.7'
+      aws-region:
+        description: 'AWS region'
+        type: string
+        required: false
+        default: 'us-east-1'
+      plan-only:
+        description: 'Generate plan only — skip apply (use on PRs)'
+        type: boolean
+        required: false
+        default: false
+      auto-approve:
+        description: 'Apply without manual approval gate'
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      aws-role-arn:
+        description: 'IAM Role ARN to assume via OIDC'
+        required: true
+    outputs:
+      plan-has-changes:
+        description: 'true if the plan contains infrastructure changes'
+        value: ${{ jobs.terraform.outputs.plan-has-changes }}
+      plan-summary:
+        description: 'Human-readable summary line from terraform plan'
+        value: ${{ jobs.terraform.outputs.plan-summary }}
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.plan-only && 'Plan' || 'Apply' }} (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      plan-has-changes: ${{ steps.plan.outputs.has-changes }}
+      plan-summary:     ${{ steps.plan.outputs.summary }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Setup Terraform ${{ inputs.terraform-version }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: true
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -out=tfplan -input=false -detailed-exitcode 2>&1 | tee plan.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          # exit code 0 = no changes, 2 = changes present, 1 = error
+          if [ "${EXIT_CODE}" -eq 1 ]; then
+            echo "Terraform plan failed."
+            exit 1
+          fi
+
+          HAS_CHANGES="false"
+          if [ "${EXIT_CODE}" -eq 2 ]; then
+            HAS_CHANGES="true"
+          fi
+
+          SUMMARY=$(grep -E '^Plan:|^No changes\.' plan.txt | head -1 || echo "See plan output for details.")
+
+          echo "has-changes=${HAS_CHANGES}" >> "$GITHUB_OUTPUT"
+          echo "summary=${SUMMARY}"         >> "$GITHUB_OUTPUT"
+
+      - name: Post plan to step summary
+        run: |
+          echo "### Terraform Plan — \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | ----- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Directory | \`${{ inputs.working-directory }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Has changes | \`${{ steps.plan.outputs.has-changes }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Summary | ${{ steps.plan.outputs.summary }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Full plan output</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```hcl' >> "$GITHUB_STEP_SUMMARY"
+          cat plan.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform Apply (dev or auto-approve)
+        if: >-
+          inputs.plan-only == false &&
+          (inputs.auto-approve == true || inputs.environment == 'dev')
+        run: terraform apply -auto-approve -input=false tfplan
+
+      - name: Terraform Apply (prod — gated by GitHub Environment)
+        if: >-
+          inputs.plan-only == false &&
+          inputs.auto-approve == false &&
+          inputs.environment == 'prod'
+        run: |
+          echo "Applying to production. Approval was enforced by the GitHub Environment protection rule."
+          terraform apply -auto-approve -input=false tfplan
