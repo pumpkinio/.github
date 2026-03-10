@@ -80,7 +80,6 @@ jobs:
         run: ${{ inputs.install-command }}
 
       - name: Inject build-time environment variables
-        if: ${{ secrets.env-vars != '' }}
         shell: bash
         run: |
           # Parse the JSON string and export each key=value pair for subsequent steps.
