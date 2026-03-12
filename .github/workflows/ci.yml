@@ -1,0 +1,30 @@
+name: Validate Workflows
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'actions/**'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Lint YAML files
+        run: |
+          pip install yamllint
+          yamllint -d '{extends: default, rules: {line-length: {max: 200}, truthy: {check-keys: false}}}' .github/workflows/ actions/
+
+      - name: Validate action references are SHA-pinned
+        run: |
+          echo "Checking for unpinned third-party action references..."
+          UNPINNED=$(grep -rn "uses:.*@v[0-9]" .github/workflows/ actions/ | grep -v "pumpkinio/" || true)
+          if [[ -n "$UNPINNED" ]]; then
+            echo "::error::Found unpinned third-party actions (missing SHA):"
+            echo "$UNPINNED"
+            exit 1
+          fi
+          echo "All third-party actions are SHA-pinned."
