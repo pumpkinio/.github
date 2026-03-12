@@ -1,4 +1,4 @@
-name: Terraform Deploy
+name: OpenTofu Deploy
 
 on:
   workflow_call:
@@ -8,14 +8,14 @@ on:
         type: string
         required: true
       working-directory:
-        description: 'Terraform root module directory (e.g. terraform/dev)'
+        description: 'OpenTofu root module directory (e.g. terraform/dev)'
         type: string
         required: true
-      terraform-version:
-        description: 'Terraform CLI version to install'
+      tofu-version:
+        description: 'OpenTofu CLI version to install'
         type: string
         required: false
-        default: '1.7'
+        default: '1.8'
       aws-region:
         description: 'AWS region'
         type: string
@@ -43,12 +43,12 @@ on:
         description: 'true if the plan contains infrastructure changes'
         value: ${{ jobs.terraform.outputs.plan-has-changes }}
       plan-summary:
-        description: 'Human-readable summary line from terraform plan'
+        description: 'Human-readable summary line from tofu plan'
         value: ${{ jobs.terraform.outputs.plan-summary }}
 
 jobs:
   terraform:
-    name: Terraform ${{ inputs.plan-only && 'Plan' || 'Apply' }} (${{ inputs.environment }})
+    name: OpenTofu ${{ inputs.plan-only && 'Plan' || 'Apply' }} (${{ inputs.environment }})
     runs-on: ubuntu-latest
 
     defaults:
@@ -73,11 +73,10 @@ jobs:
           role-to-assume: ${{ secrets.aws-role-arn }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Setup Terraform ${{ inputs.terraform-version }}
-        uses: hashicorp/setup-terraform@v3
+      - name: Setup OpenTofu ${{ inputs.tofu-version }}
+        uses: opentofu/setup-opentofu@v1
         with:
-          terraform_version: ${{ inputs.terraform-version }}
-          terraform_wrapper: true
+          tofu_version: ${{ inputs.tofu-version }}
 
       - name: Write sensitive variables
         env:
@@ -87,34 +86,24 @@ jobs:
             printf '%s\n' "$TF_SENSITIVE_VARS" > .sensitive.auto.tfvars
           fi
 
-      - name: Create Lambda placeholder zips
-        run: |
-          # Terraform resolves filebase64sha256() relative to the root module (working-directory).
-          # Create placeholder zips here so terraform validate/plan succeed.
-          echo "exports.handler = async () => ({ statusCode: 200 });" > /tmp/index.js
-          (cd /tmp && zip -j lambda-placeholder.zip index.js && zip -j lambda-layer-placeholder.zip index.js)
-          cp /tmp/lambda-placeholder.zip .
-          cp /tmp/lambda-layer-placeholder.zip .
-          echo "Created placeholder zips in $(pwd)"
+      - name: OpenTofu Init
+        run: tofu init -input=false
 
-      - name: Terraform Init
-        run: terraform init -input=false
+      - name: OpenTofu Validate
+        run: tofu validate
 
-      - name: Terraform Validate
-        run: terraform validate
+      - name: OpenTofu Format Check
+        run: tofu fmt -check -recursive
 
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-
-      - name: Terraform Plan
+      - name: OpenTofu Plan
         id: plan
         run: |
-          terraform plan -out=tfplan -input=false -detailed-exitcode 2>&1 | tee plan.txt
+          tofu plan -out=tfplan -input=false -detailed-exitcode 2>&1 | tee plan.txt
           EXIT_CODE=${PIPESTATUS[0]}
 
           # exit code 0 = no changes, 2 = changes present, 1 = error
           if [ "${EXIT_CODE}" -eq 1 ]; then
-            echo "Terraform plan failed."
+            echo "OpenTofu plan failed."
             exit 1
           fi
 
@@ -130,7 +119,7 @@ jobs:
 
       - name: Post plan to step summary
         run: |
-          echo "### Terraform Plan — \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### OpenTofu Plan — \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "| --- | ----- |" >> "$GITHUB_STEP_SUMMARY"
@@ -145,17 +134,17 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Terraform Apply (dev or auto-approve)
+      - name: OpenTofu Apply (dev or auto-approve)
         if: >-
           inputs.plan-only == false &&
           (inputs.auto-approve == true || inputs.environment == 'dev')
-        run: terraform apply -auto-approve -input=false tfplan
+        run: tofu apply -auto-approve -input=false tfplan
 
-      - name: Terraform Apply (prod — gated by GitHub Environment)
+      - name: OpenTofu Apply (prod — gated by GitHub Environment)
         if: >-
           inputs.plan-only == false &&
           inputs.auto-approve == false &&
           inputs.environment == 'prod'
         run: |
           echo "Applying to production. Approval was enforced by the GitHub Environment protection rule."
-          terraform apply -auto-approve -input=false tfplan
+          tofu apply -auto-approve -input=false tfplan
