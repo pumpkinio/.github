@@ -62,22 +62,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Validate inputs
+        run: |
+          if [[ "${{ inputs.environment }}" != "dev" && "${{ inputs.environment }}" != "prod" ]]; then
+            echo "::error::Invalid environment '${{ inputs.environment }}'. Must be 'dev' or 'prod'."
+            exit 1
+          fi
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
         with:
           role-to-assume: ${{ secrets.aws-role-arn }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Set up Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Setup Node.js
+        uses: pumpkinio/.github/actions/setup-node@main
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
-
-      - name: Install dependencies
-        working-directory: ${{ inputs.working-directory }}
-        run: ${{ inputs.install-command }}
+          working-directory: ${{ inputs.working-directory }}
 
       - name: Inject build-time environment variables
         shell: bash

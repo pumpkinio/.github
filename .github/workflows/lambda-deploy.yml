@@ -50,6 +50,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Validate inputs
+        run: |
+          if [[ "${{ inputs.environment }}" != "dev" && "${{ inputs.environment }}" != "prod" ]]; then
+            echo "::error::Invalid environment '${{ inputs.environment }}'. Must be 'dev' or 'prod'."
+            exit 1
+          fi
+          if [[ ! -d "${{ inputs.functions-directory }}" ]]; then
+            echo "::error::Functions directory '${{ inputs.functions-directory }}' does not exist."
+            exit 1
+          fi
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
         with:
