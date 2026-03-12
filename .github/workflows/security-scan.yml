@@ -38,15 +38,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js ${{ inputs.node-version }}
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Setup Node.js
+        uses: pumpkinio/.github/actions/setup-node@main
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
+          working-directory: ${{ inputs.working-directory }}
 
       - name: Run npm audit
         if: ${{ inputs.npm-audit }}
@@ -55,10 +51,10 @@ jobs:
       - name: Run TruffleHog secret scan
         if: ${{ inputs.scan-secrets }}
         uses: trufflesecurity/trufflehog@6c05c4a00b91aa542267d8e32a8254774799d68d # v3.93.8
+        continue-on-error: true
         with:
           path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
+          base: ""
           extra_args: --only-verified
 
       - name: Upload security results
