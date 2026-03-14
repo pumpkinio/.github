@@ -151,18 +151,26 @@ jobs:
                 echo "::warning::Shared directory not found at $SHARED_DIR — skipping"
               fi
 
-              # Copy package.json: prefer function-local, fall back to root
+              # Install production-only dependencies
+              # Priority: function-local package.json > functions-directory package.json > root
               if [[ -f "$fn_dir/package.json" ]]; then
                 cp "$fn_dir/package.json" "$build_dir/package.json"
+              elif [[ -f "$FUNCTIONS_DIR/package.json" ]]; then
+                cp "$FUNCTIONS_DIR/package.json" "$build_dir/package.json"
               elif [[ -f "package.json" ]]; then
                 cp "package.json" "$build_dir/package.json"
               fi
 
-              # Copy node_modules: prefer function-local, fall back to root
-              if [[ -d "$fn_dir/node_modules" ]]; then
-                cp -r "$fn_dir/node_modules" "$build_dir/node_modules"
-              elif [[ -d "node_modules" ]]; then
-                cp -r "node_modules" "$build_dir/node_modules"
+              if [[ -f "$build_dir/package.json" ]]; then
+                # Copy lockfile if available for deterministic installs
+                if [[ -f "$fn_dir/package-lock.json" ]]; then
+                  cp "$fn_dir/package-lock.json" "$build_dir/package-lock.json"
+                elif [[ -f "$FUNCTIONS_DIR/package-lock.json" ]]; then
+                  cp "$FUNCTIONS_DIR/package-lock.json" "$build_dir/package-lock.json"
+                fi
+
+                echo "Installing production dependencies..."
+                (cd "$build_dir" && npm install --omit=dev --no-audit --no-fund 2>&1 | tail -3)
               fi
 
               # Package into zip
