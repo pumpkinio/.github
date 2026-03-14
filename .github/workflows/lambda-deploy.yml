@@ -147,12 +147,16 @@ jobs:
               #     package.json
               mkdir -p "$build_dir/$fn_name"
 
-              # Copy handler .js files into function subdirectory
-              if compgen -G "$fn_dir/*.js" > /dev/null 2>&1; then
-                cp "$fn_dir"/*.js "$build_dir/$fn_name/"
-              else
-                echo "::warning::No .js handler files found in $fn_dir"
-              fi
+              # Copy all handler source files into function subdirectory
+              # (includes .js files and any subdirectories like utils/, local shared/)
+              find "$fn_dir" -maxdepth 1 -name '*.js' -o -name '*.cjs' -o -name '*.mjs' | while read -r f; do
+                cp "$f" "$build_dir/$fn_name/"
+              done
+              # Copy subdirectories (excluding node_modules, __tests__, package*.json)
+              find "$fn_dir" -mindepth 1 -maxdepth 1 -type d \
+                -not -name node_modules -not -name __tests__ | while read -r subdir; do
+                cp -r "$subdir" "$build_dir/$fn_name/"
+              done
 
               # Copy shared directory as sibling of handler dir
               if [[ -d "$SHARED_DIR" ]]; then
