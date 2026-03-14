@@ -137,14 +137,24 @@ jobs:
 
               mkdir -p "$build_dir"
 
-              # Copy handler .js files from function directory
+              # Preserve source directory structure so require('../shared/...') works:
+              #   zip root/
+              #     $fn_name/        ← handler subdirectory
+              #       handler.js
+              #     shared/          ← sibling of handler dir
+              #       logger.cjs
+              #     node_modules/
+              #     package.json
+              mkdir -p "$build_dir/$fn_name"
+
+              # Copy handler .js files into function subdirectory
               if compgen -G "$fn_dir/*.js" > /dev/null 2>&1; then
-                cp "$fn_dir"/*.js "$build_dir/"
+                cp "$fn_dir"/*.js "$build_dir/$fn_name/"
               else
                 echo "::warning::No .js handler files found in $fn_dir"
               fi
 
-              # Copy shared directory into build dir
+              # Copy shared directory as sibling of handler dir
               if [[ -d "$SHARED_DIR" ]]; then
                 cp -r "$SHARED_DIR" "$build_dir/shared"
               else
@@ -188,8 +198,21 @@ jobs:
                 --output json \
                 | jq -r '"  CodeSize: \(.CodeSize) bytes | Runtime: \(.Runtime) | LastModified: \(.LastModified)"'
 
-              # Wait for update to propagate
+              # Wait for code update to propagate
               echo "Waiting for function update to complete..."
+              aws lambda wait function-updated \
+                --function-name "$lambda_name" \
+                --region "${{ inputs.aws-region }}"
+
+              # Update handler to match subdirectory layout: fn_name/fn_name.handler
+              NEW_HANDLER="$fn_name/$fn_name.handler"
+              echo "  Setting handler to: $NEW_HANDLER"
+              aws lambda update-function-configuration \
+                --function-name "$lambda_name" \
+                --handler "$NEW_HANDLER" \
+                --region "${{ inputs.aws-region }}" \
+                --output json | jq -r '"  Handler: \(.Handler)"'
+
               aws lambda wait function-updated \
                 --function-name "$lambda_name" \
                 --region "${{ inputs.aws-region }}"
