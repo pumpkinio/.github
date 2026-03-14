@@ -31,6 +31,10 @@ on:
         description: 'Command to install dependencies'
         type: string
         default: 'npm ci'
+      install-directory:
+        description: 'Directory containing package-lock.json (defaults to working-directory; set to repo root for npm workspaces)'
+        type: string
+        default: ''
     secrets:
       aws-role-arn:
         description: 'ARN of the IAM role to assume via OIDC'
@@ -80,6 +84,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           working-directory: ${{ inputs.working-directory }}
+          install-directory: ${{ inputs.install-directory }}
 
       - name: Inject build-time environment variables
         shell: bash

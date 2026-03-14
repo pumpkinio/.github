@@ -141,17 +141,38 @@ jobs:
 
             echo "→ Applying migration..."
 
-            SQL_CONTENT=$(cat "${MIGRATION_FILE}")
+            # Aurora Data API does not support multi-statement execution.
+            # Split on semicolons, strip comments, and execute each statement.
+            STMT_NUM=0
+            CURRENT_STMT=""
+            while IFS= read -r LINE; do
+              # Skip pure comment lines and blank lines
+              TRIMMED=$(echo "$LINE" | sed 's/^[[:space:]]*//')
+              [[ "$TRIMMED" == --* ]] && continue
+              [[ -z "$TRIMMED" ]] && continue
 
-            # Execute the migration via Aurora Data API
-            if ! aws rds-data execute-statement \
-                --resource-arn "${CLUSTER_ARN}" \
-                --secret-arn   "${SECRET_ARN}" \
-                --database     "${DB_NAME}" \
-                --sql          "${SQL_CONTENT}"; then
-              echo "✗ Migration '${FILENAME}' FAILED. Aborting."
-              exit 1
-            fi
+              CURRENT_STMT="${CURRENT_STMT} ${TRIMMED}"
+
+              # If line ends with semicolon, execute accumulated statement
+              if [[ "$TRIMMED" == *";" ]]; then
+                # Remove trailing semicolon
+                CURRENT_STMT=$(echo "$CURRENT_STMT" | sed 's/;[[:space:]]*$//' | xargs)
+                [[ -z "$CURRENT_STMT" ]] && continue
+
+                STMT_NUM=$((STMT_NUM + 1))
+                echo "  Statement ${STMT_NUM}: $(echo "$CURRENT_STMT" | head -c 80)..."
+
+                if ! aws rds-data execute-statement \
+                    --resource-arn "${CLUSTER_ARN}" \
+                    --secret-arn   "${SECRET_ARN}" \
+                    --database     "${DB_NAME}" \
+                    --sql          "${CURRENT_STMT}"; then
+                  echo "✗ Migration '${FILENAME}' statement ${STMT_NUM} FAILED. Aborting."
+                  exit 1
+                fi
+                CURRENT_STMT=""
+              fi
+            done < "${MIGRATION_FILE}"
 
             # Record the applied version
             aws rds-data execute-statement \
