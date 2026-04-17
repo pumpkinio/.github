@@ -31,6 +31,14 @@ on:
         description: 'Comma-separated list of subdirectory names to skip'
         type: string
         default: 'shared,__tests__,node_modules'
+      include-functions:
+        description: 'Comma-separated list of function names to deploy (empty = all)'
+        type: string
+        default: ''
+      max-parallel:
+        description: 'Max parallel Lambda deployments'
+        type: number
+        default: 4
     secrets:
       aws-role-arn:
         description: 'ARN of the IAM role to assume via OIDC'
@@ -85,8 +93,10 @@ jobs:
           SHARED_DIR="${{ inputs.shared-directory }}"
           FUNCTION_PREFIX="${{ inputs.function-prefix }}"
           EXCLUDE_DIRS="${{ inputs.exclude-dirs }}"
+          INCLUDE_FUNCTIONS="${{ inputs.include-functions }}"
+          MAX_PARALLEL=${{ inputs.max-parallel }}
 
-          # Build exclusion array
+          # Build exclusion map
           IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
           declare -A EXCLUDE_MAP
           for dir in "${EXCLUDE_ARRAY[@]}"; do
@@ -94,79 +104,78 @@ jobs:
             EXCLUDE_MAP["$trimmed"]=1
           done
 
+          # Build inclusion map (if specified)
+          declare -A INCLUDE_MAP
+          INCLUDE_FILTER=false
+          if [[ -n "$INCLUDE_FUNCTIONS" ]]; then
+            INCLUDE_FILTER=true
+            IFS=',' read -ra INCLUDE_ARRAY <<< "$INCLUDE_FUNCTIONS"
+            for fn in "${INCLUDE_ARRAY[@]}"; do
+              trimmed="$(echo "$fn" | xargs)"
+              INCLUDE_MAP["$trimmed"]=1
+            done
+            echo "Selective deploy: ${#INCLUDE_ARRAY[@]} function(s) requested"
+          fi
+
           # Collect function directories
           FUNCTION_DIRS=()
           while IFS= read -r -d '' entry; do
             dirname="$(basename "$entry")"
-            if [[ -z "${EXCLUDE_MAP[$dirname]+_}" ]]; then
-              FUNCTION_DIRS+=("$entry")
+            if [[ -n "${EXCLUDE_MAP[$dirname]+_}" ]]; then
+              continue
             fi
+            if [[ "$INCLUDE_FILTER" == "true" && -z "${INCLUDE_MAP[$dirname]+_}" ]]; then
+              continue
+            fi
+            FUNCTION_DIRS+=("$entry")
           done < <(find "$FUNCTIONS_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
 
           if [[ ${#FUNCTION_DIRS[@]} -eq 0 ]]; then
-            echo "::error::No function directories found in $FUNCTIONS_DIR"
+            echo "::error::No function directories found to deploy"
             exit 1
           fi
 
-          echo "Discovered ${#FUNCTION_DIRS[@]} function(s) to deploy:"
+          echo "Deploying ${#FUNCTION_DIRS[@]} function(s) (max $MAX_PARALLEL parallel):"
           for fn_dir in "${FUNCTION_DIRS[@]}"; do
             echo "  - $(basename "$fn_dir")"
           done
 
-          # Track failures
-          FAILED_FUNCTIONS=()
-          DEPLOYED_FUNCTIONS=()
-
+          # Create work and log directories
           WORK_DIR="$(mktemp -d)"
-          trap 'rm -rf "$WORK_DIR"' EXIT
+          LOG_DIR="$(mktemp -d)"
+          trap 'rm -rf "$WORK_DIR" "$LOG_DIR"' EXIT
 
-          for fn_dir in "${FUNCTION_DIRS[@]}"; do
-            fn_name="$(basename "$fn_dir")"
-            lambda_name="${FUNCTION_PREFIX}${fn_name}"
-            build_dir="$WORK_DIR/$fn_name"
-            zip_path="$WORK_DIR/${fn_name}.zip"
+          # Deploy function (called per-function, runs in background)
+          deploy_function() {
+            local fn_dir="$1"
+            local fn_name="$(basename "$fn_dir")"
+            local lambda_name="${FUNCTION_PREFIX}${fn_name}"
+            local build_dir="$WORK_DIR/$fn_name"
+            local zip_path="$WORK_DIR/${fn_name}.zip"
+            local log_file="$LOG_DIR/${fn_name}.log"
+            local START_TIME=$(date +%s)
 
-            echo ""
-            echo "=========================================="
-            echo "Deploying: $lambda_name"
-            echo "=========================================="
-            START_TIME=$(date +%s)
-
-            (
+            {
               set -euo pipefail
 
-              mkdir -p "$build_dir"
-
-              # Preserve source directory structure so require('../shared/...') works:
-              #   zip root/
-              #     $fn_name/        ← handler subdirectory
-              #       handler.js
-              #     shared/          ← sibling of handler dir
-              #       logger.cjs
-              #     node_modules/
-              #     package.json
               mkdir -p "$build_dir/$fn_name"
 
-              # Copy all handler source files into function subdirectory
-              # (includes .js files and any subdirectories like utils/, local shared/)
+              # Copy handler source files
               find "$fn_dir" -maxdepth 1 -name '*.js' -o -name '*.cjs' -o -name '*.mjs' | while read -r f; do
                 cp "$f" "$build_dir/$fn_name/"
               done
-              # Copy subdirectories (excluding node_modules, __tests__, package*.json)
+              # Copy subdirectories
               find "$fn_dir" -mindepth 1 -maxdepth 1 -type d \
                 -not -name node_modules -not -name __tests__ | while read -r subdir; do
                 cp -r "$subdir" "$build_dir/$fn_name/"
               done
 
-              # Copy shared directory as sibling of handler dir
+              # Copy shared directory
               if [[ -d "$SHARED_DIR" ]]; then
                 cp -r "$SHARED_DIR" "$build_dir/shared"
-              else
-                echo "::warning::Shared directory not found at $SHARED_DIR — skipping"
               fi
 
-              # Install production-only dependencies
-              # Priority: function-local package.json > functions-directory package.json > root
+              # Install production dependencies
               if [[ -f "$fn_dir/package.json" ]]; then
                 cp "$fn_dir/package.json" "$build_dir/package.json"
               elif [[ -f "$FUNCTIONS_DIR/package.json" ]]; then
@@ -176,41 +185,33 @@ jobs:
               fi
 
               if [[ -f "$build_dir/package.json" ]]; then
-                # Copy lockfile if available for deterministic installs
                 if [[ -f "$fn_dir/package-lock.json" ]]; then
                   cp "$fn_dir/package-lock.json" "$build_dir/package-lock.json"
                 elif [[ -f "$FUNCTIONS_DIR/package-lock.json" ]]; then
                   cp "$FUNCTIONS_DIR/package-lock.json" "$build_dir/package-lock.json"
                 fi
-
-                echo "Installing production dependencies..."
                 (cd "$build_dir" && npm install --omit=dev --no-audit --no-fund 2>&1 | tail -3)
               fi
 
               # Package into zip
               (cd "$build_dir" && zip -qr "$zip_path" .)
-
               ZIP_SIZE=$(du -sh "$zip_path" | cut -f1)
-              echo "Package size: $ZIP_SIZE"
+              echo "  Package: $ZIP_SIZE"
 
               # Deploy to Lambda
-              echo "Uploading code to Lambda..."
               aws lambda update-function-code \
                 --function-name "$lambda_name" \
                 --zip-file "fileb://$zip_path" \
                 --region "${{ inputs.aws-region }}" \
                 --output json \
-                | jq -r '"  CodeSize: \(.CodeSize) bytes | Runtime: \(.Runtime) | LastModified: \(.LastModified)"'
+                | jq -r '"  CodeSize: \(.CodeSize) bytes"'
 
-              # Wait for code update to propagate
-              echo "Waiting for function update to complete..."
               aws lambda wait function-updated \
                 --function-name "$lambda_name" \
                 --region "${{ inputs.aws-region }}"
 
-              # Update handler to match subdirectory layout: fn_name/fn_name.handler
+              # Update handler
               NEW_HANDLER="$fn_name/$fn_name.handler"
-              echo "  Setting handler to: $NEW_HANDLER"
               aws lambda update-function-configuration \
                 --function-name "$lambda_name" \
                 --handler "$NEW_HANDLER" \
@@ -221,26 +222,57 @@ jobs:
                 --function-name "$lambda_name" \
                 --region "${{ inputs.aws-region }}"
 
-              # Retrieve and print the published version info
-              FUNC_INFO=$(aws lambda get-function-configuration \
-                --function-name "$lambda_name" \
-                --region "${{ inputs.aws-region }}" \
-                --output json)
-              FUNC_VERSION=$(echo "$FUNC_INFO" | jq -r '.Version')
-              FUNC_STATE=$(echo "$FUNC_INFO"   | jq -r '.State')
-              echo "  Version: $FUNC_VERSION | State: $FUNC_STATE"
+              local END_TIME=$(date +%s)
+              local ELAPSED=$((END_TIME - START_TIME))
+              echo "OK deployed in ${ELAPSED}s"
+            } > "$log_file" 2>&1
 
-            ) && DEPLOY_OK=true || DEPLOY_OK=false
+            return $?
+          }
 
-            END_TIME=$(date +%s)
-            ELAPSED=$((END_TIME - START_TIME))
+          # Parallel deploy with concurrency control
+          PIDS=()
+          FN_NAMES=()
+          ACTIVE=0
 
-            if [[ "$DEPLOY_OK" == "true" ]]; then
-              echo "OK $lambda_name deployed in ${ELAPSED}s"
+          for fn_dir in "${FUNCTION_DIRS[@]}"; do
+            fn_name="$(basename "$fn_dir")"
+
+            # Wait if at max concurrency
+            while [[ $ACTIVE -ge $MAX_PARALLEL ]]; do
+              # Wait for any child to finish
+              wait -n 2>/dev/null || true
+              ACTIVE=$((ACTIVE - 1))
+            done
+
+            echo "Starting: ${FUNCTION_PREFIX}${fn_name}"
+            deploy_function "$fn_dir" &
+            PIDS+=($!)
+            FN_NAMES+=("$fn_name")
+            ACTIVE=$((ACTIVE + 1))
+          done
+
+          # Wait for all remaining jobs
+          FAILED_FUNCTIONS=()
+          DEPLOYED_FUNCTIONS=()
+
+          for i in "${!PIDS[@]}"; do
+            pid="${PIDS[$i]}"
+            fn_name="${FN_NAMES[$i]}"
+            lambda_name="${FUNCTION_PREFIX}${fn_name}"
+            log_file="$LOG_DIR/${fn_name}.log"
+
+            if wait "$pid"; then
+              echo "[OK] $lambda_name"
               DEPLOYED_FUNCTIONS+=("$lambda_name")
             else
-              echo "::error::FAILED to deploy $lambda_name (after ${ELAPSED}s)"
+              echo "[FAIL] $lambda_name"
               FAILED_FUNCTIONS+=("$lambda_name")
+            fi
+
+            # Print log output
+            if [[ -f "$log_file" ]]; then
+              sed "s/^/  [$fn_name] /" "$log_file"
             fi
           done
 
@@ -249,21 +281,17 @@ jobs:
           echo "=========================================="
           echo "Deployment Summary"
           echo "=========================================="
-          echo "Succeeded (${#DEPLOYED_FUNCTIONS[@]}):"
-          for fn in "${DEPLOYED_FUNCTIONS[@]}"; do
-            echo "  [OK] $fn"
-          done
+          echo "Succeeded: ${#DEPLOYED_FUNCTIONS[@]}"
+          echo "Failed: ${#FAILED_FUNCTIONS[@]}"
 
           if [[ ${#FAILED_FUNCTIONS[@]} -gt 0 ]]; then
             echo ""
-            echo "Failed (${#FAILED_FUNCTIONS[@]}):"
             for fn in "${FAILED_FUNCTIONS[@]}"; do
               echo "  [FAIL] $fn"
             done
             echo ""
-            echo "::error::${#FAILED_FUNCTIONS[@]} function(s) failed to deploy. See above for details."
+            echo "::error::${#FAILED_FUNCTIONS[@]} function(s) failed to deploy."
             exit 1
           else
-            echo ""
             echo "All ${#DEPLOYED_FUNCTIONS[@]} function(s) deployed successfully."
           fi
