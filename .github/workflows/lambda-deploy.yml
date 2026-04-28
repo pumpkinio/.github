@@ -145,6 +145,22 @@ jobs:
           LOG_DIR="$(mktemp -d)"
           trap 'rm -rf "$WORK_DIR" "$LOG_DIR"' EXIT
 
+          # ── Build shared node_modules ONCE (skip 30+ redundant npm installs) ──
+          SHARED_DEPS_DIR="$WORK_DIR/_shared_deps"
+          mkdir -p "$SHARED_DEPS_DIR"
+
+          if [[ -f "$FUNCTIONS_DIR/package.json" ]]; then
+            cp "$FUNCTIONS_DIR/package.json" "$SHARED_DEPS_DIR/package.json"
+            [[ -f "$FUNCTIONS_DIR/package-lock.json" ]] && cp "$FUNCTIONS_DIR/package-lock.json" "$SHARED_DEPS_DIR/package-lock.json"
+          elif [[ -f "package.json" ]]; then
+            cp "package.json" "$SHARED_DEPS_DIR/package.json"
+          fi
+
+          if [[ -f "$SHARED_DEPS_DIR/package.json" ]]; then
+            echo "Installing shared production dependencies (once for all functions)..."
+            (cd "$SHARED_DEPS_DIR" && npm install --omit=dev --no-audit --no-fund 2>&1 | tail -3)
+          fi
+
           # Deploy function (called per-function, runs in background)
           deploy_function() {
             local fn_dir="$1"
@@ -161,36 +177,24 @@ jobs:
               mkdir -p "$build_dir/$fn_name"
 
               # Copy handler source files
-              find "$fn_dir" -maxdepth 1 -name '*.js' -o -name '*.cjs' -o -name '*.mjs' | while read -r f; do
-                cp "$f" "$build_dir/$fn_name/"
-              done
+              find "$fn_dir" -maxdepth 1 \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' \) -exec cp {} "$build_dir/$fn_name/" \;
               # Copy subdirectories
               find "$fn_dir" -mindepth 1 -maxdepth 1 -type d \
-                -not -name node_modules -not -name __tests__ | while read -r subdir; do
-                cp -r "$subdir" "$build_dir/$fn_name/"
-              done
+                -not -name node_modules -not -name __tests__ -exec cp -r {} "$build_dir/$fn_name/" \;
 
               # Copy shared directory
               if [[ -d "$SHARED_DIR" ]]; then
                 cp -r "$SHARED_DIR" "$build_dir/shared"
               fi
 
-              # Install production dependencies
+              # Use function-local package.json if exists, else reuse shared deps
               if [[ -f "$fn_dir/package.json" ]]; then
                 cp "$fn_dir/package.json" "$build_dir/package.json"
-              elif [[ -f "$FUNCTIONS_DIR/package.json" ]]; then
-                cp "$FUNCTIONS_DIR/package.json" "$build_dir/package.json"
-              elif [[ -f "package.json" ]]; then
-                cp "package.json" "$build_dir/package.json"
-              fi
-
-              if [[ -f "$build_dir/package.json" ]]; then
-                if [[ -f "$fn_dir/package-lock.json" ]]; then
-                  cp "$fn_dir/package-lock.json" "$build_dir/package-lock.json"
-                elif [[ -f "$FUNCTIONS_DIR/package-lock.json" ]]; then
-                  cp "$FUNCTIONS_DIR/package-lock.json" "$build_dir/package-lock.json"
-                fi
-                (cd "$build_dir" && npm install --omit=dev --no-audit --no-fund 2>&1 | tail -3)
+                [[ -f "$fn_dir/package-lock.json" ]] && cp "$fn_dir/package-lock.json" "$build_dir/package-lock.json"
+                (cd "$build_dir" && npm install --omit=dev --no-audit --no-fund 2>&1 | tail -1)
+              elif [[ -d "$SHARED_DEPS_DIR/node_modules" ]]; then
+                cp -r "$SHARED_DEPS_DIR/node_modules" "$build_dir/node_modules"
+                [[ -f "$SHARED_DEPS_DIR/package.json" ]] && cp "$SHARED_DEPS_DIR/package.json" "$build_dir/package.json"
               fi
 
               # Package into zip
@@ -210,17 +214,24 @@ jobs:
                 --function-name "$lambda_name" \
                 --region "${{ inputs.aws-region }}"
 
-              # Update handler
-              NEW_HANDLER="$fn_name/$fn_name.handler"
-              aws lambda update-function-configuration \
+              # Only update handler if it differs (saves ~5s wait per Lambda)
+              local CURRENT_HANDLER
+              CURRENT_HANDLER=$(aws lambda get-function-configuration \
                 --function-name "$lambda_name" \
-                --handler "$NEW_HANDLER" \
                 --region "${{ inputs.aws-region }}" \
-                --output json | jq -r '"  Handler: \(.Handler)"'
+                --query 'Handler' --output text 2>/dev/null || echo "")
+              local NEW_HANDLER="$fn_name/$fn_name.handler"
 
-              aws lambda wait function-updated \
-                --function-name "$lambda_name" \
-                --region "${{ inputs.aws-region }}"
+              if [[ "$CURRENT_HANDLER" != "$NEW_HANDLER" ]]; then
+                aws lambda update-function-configuration \
+                  --function-name "$lambda_name" \
+                  --handler "$NEW_HANDLER" \
+                  --region "${{ inputs.aws-region }}" \
+                  --output json | jq -r '"  Handler: \(.Handler)"'
+                aws lambda wait function-updated \
+                  --function-name "$lambda_name" \
+                  --region "${{ inputs.aws-region }}"
+              fi
 
               local END_TIME=$(date +%s)
               local ELAPSED=$((END_TIME - START_TIME))
