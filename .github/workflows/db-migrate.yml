@@ -186,7 +186,7 @@ jobs:
             APPLIED_COUNT=$((APPLIED_COUNT + 1))
             APPLIED_VERSIONS="${APPLIED_VERSIONS} ${VERSION}"
 
-          done < <(find "${MIGRATIONS_DIR}" -maxdepth 1 -name '*.sql' -print0 | sort -z)
+          done < <(find "${MIGRATIONS_DIR}" -maxdepth 1 -name '*.sql' ! -name '*.down.sql' -print0 | sort -z)
 
           echo ""
           echo "═══════════════════════════════════════════"
