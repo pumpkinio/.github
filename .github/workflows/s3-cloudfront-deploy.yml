@@ -48,6 +48,9 @@ on:
       env-vars:
         description: 'Optional JSON string of VITE_* environment variables to inject at build time, e.g. {"VITE_API_URL":"https://api.example.com"}'
         required: false
+      extra-env-vars:
+        description: 'Optional second JSON string of VITE_* variables, merged over env-vars. Lets a repo keep a value in its own secret instead of editing one combined blob.'
+        required: false
 
 permissions:
   id-token: write
@@ -88,21 +91,32 @@ jobs:
 
       - name: Inject build-time environment variables
         shell: bash
+        env:
+          # Passed via env (not inline interpolation) so quotes in a value can't
+          # break out of the shell command.
+          ENV_JSON: ${{ secrets.env-vars }}
+          EXTRA_ENV_JSON: ${{ secrets.extra-env-vars }}
         run: |
-          # Parse the JSON string and export each key=value pair for subsequent steps.
+          # Parse the JSON string(s) and export each key=value pair for subsequent steps.
           # Supports string values only; numbers/booleans are converted to strings automatically.
-          ENV_JSON='${{ secrets.env-vars }}'
-          if [[ -z "$ENV_JSON" ]]; then
+          # extra-env-vars is merged over env-vars, so a repo can keep a value in
+          # its own secret rather than editing one combined blob.
+          if [[ -z "$ENV_JSON" && -z "$EXTRA_ENV_JSON" ]]; then
             echo "No env-vars provided — skipping."
             exit 0
           fi
 
-          echo "Exporting VITE_* environment variables from env-vars secret..."
+          MERGED=$(jq -s -n \
+            --argjson a "${ENV_JSON:-{\}}" \
+            --argjson b "${EXTRA_ENV_JSON:-{\}}" \
+            '$a * $b')
+
+          echo "Exporting VITE_* environment variables..."
           while IFS='=' read -r key value; do
             # Write to $GITHUB_ENV so the value is available in all subsequent steps
             echo "${key}=${value}" >> "$GITHUB_ENV"
             echo "  Exported: $key"
-          done < <(echo "$ENV_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+          done < <(echo "$MERGED" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
 
       - name: Build frontend
         working-directory: ${{ inputs.working-directory }}
