@@ -139,48 +139,204 @@ jobs:
               continue
             fi
 
+            # Each migration applies atomically, so a failure half way through
+            # cannot leave the schema partly changed with nothing recorded in
+            # schema_migrations — which previously meant the next run replayed
+            # statements that had already committed.
+            #
+            # CREATE INDEX CONCURRENTLY (and VACUUM, and CREATE DATABASE) cannot
+            # run inside a transaction block; Postgres rejects them outright.
+            # 004-index-optimization.sql is one such migration. Those files run
+            # unwrapped, and say so, rather than failing.
+            TX_ID=""
+            TX_ARG=""
+            if grep -qiE 'concurrently|^[[:space:]]*vacuum|create[[:space:]]+database|drop[[:space:]]+database' "${MIGRATION_FILE}"; then
+              echo "  ⚠️  Contains statements that cannot run in a transaction — applying unwrapped."
+              echo "     A failure part way through this file will leave it half applied."
+            else
+              TX_ID=$(aws rds-data begin-transaction \
+                --resource-arn "${CLUSTER_ARN}" \
+                --secret-arn   "${SECRET_ARN}" \
+                --database     "${DB_NAME}" \
+                --query transactionId --output text)
+              if [ -z "${TX_ID}" ] || [ "${TX_ID}" = "None" ]; then
+                echo "✗ Could not open a transaction for '${FILENAME}'."
+                exit 1
+              fi
+              TX_ARG="--transaction-id ${TX_ID}"
+              echo "  Transaction ${TX_ID}"
+            fi
             echo "→ Applying migration..."
 
-            # Aurora Data API does not support multi-statement execution.
-            # Split on semicolons, strip comments, and execute each statement.
+            # Aurora Data API cannot execute multiple statements in one call, so
+            # the file is split here. Three things this parser has to get right,
+            # each of which the previous version got wrong:
+            #
+            # 1. NEVER pipe SQL through `xargs`. It was used to trim whitespace,
+            #    but xargs parses its input as shell words and therefore strips
+            #    quotes: `INSERT ... VALUES ('open')` reached Postgres as
+            #    `VALUES (open)` — a column reference. Corruption, not a syntax
+            #    error, so some statements became valid-but-different SQL.
+            #
+            # 2. A line ending in `;` is not always a statement boundary. Inside
+            #    a dollar-quoted block — DO $$ ... END $$;, CREATE FUNCTION,
+            #    trigger bodies — semicolons are part of the body. 16 of this
+            #    repo's 41 migrations contain such a block, so splitting on them
+            #    cut two in five migrations mid-body. DOLLAR_DEPTH tracks it.
+            #
+            # 3. Comments are only skipped outside a block. A `--` line inside a
+            #    function body is part of the body.
             STMT_NUM=0
             CURRENT_STMT=""
-            while IFS= read -r LINE; do
-              # Skip pure comment lines and blank lines
-              TRIMMED=$(echo "$LINE" | sed 's/^[[:space:]]*//')
-              [[ "$TRIMMED" == --* ]] && continue
-              [[ -z "$TRIMMED" ]] && continue
+            DOLLAR_DEPTH=0
 
-              CURRENT_STMT="${CURRENT_STMT} ${TRIMMED}"
+            while IFS= read -r LINE || [ -n "$LINE" ]; do
+              TRIMMED="$(printf '%s' "$LINE" | sed 's/^[[:space:]]*//')"
 
-              # If line ends with semicolon, execute accumulated statement
-              if [[ "$TRIMMED" == *";" ]]; then
-                # Remove trailing semicolon
-                CURRENT_STMT=$(echo "$CURRENT_STMT" | sed 's/;[[:space:]]*$//' | xargs)
-                [[ -z "$CURRENT_STMT" ]] && continue
-
-                STMT_NUM=$((STMT_NUM + 1))
-                echo "  Statement ${STMT_NUM}: $(echo "$CURRENT_STMT" | head -c 80)..."
-
-                if ! aws rds-data execute-statement \
-                    --resource-arn "${CLUSTER_ARN}" \
-                    --secret-arn   "${SECRET_ARN}" \
-                    --database     "${DB_NAME}" \
-                    --sql          "${CURRENT_STMT}"; then
-                  echo "✗ Migration '${FILENAME}' statement ${STMT_NUM} FAILED. Aborting."
-                  exit 1
-                fi
-                CURRENT_STMT=""
+              if [ "${DOLLAR_DEPTH}" -eq 0 ]; then
+                case "$TRIMMED" in
+                  --*) continue ;;
+                  '')  continue ;;
+                esac
               fi
+
+              if [ -z "$CURRENT_STMT" ]; then
+                CURRENT_STMT="$LINE"
+              else
+                CURRENT_STMT="${CURRENT_STMT}
+${LINE}"
+              fi
+
+              # Each unpaired $$ on a line flips in/out of a dollar-quoted body.
+              DOLLARS="$(printf '%s' "$LINE" | grep -o '[$][$]' | wc -l | tr -d '[:space:]')"
+              if [ $((DOLLARS % 2)) -eq 1 ]; then
+                DOLLAR_DEPTH=$((1 - DOLLAR_DEPTH))
+              fi
+
+              case "$TRIMMED" in
+                *\;)
+                  [ "${DOLLAR_DEPTH}" -ne 0 ] && continue
+
+                  # Trim surrounding whitespace and the trailing semicolon
+                  # without touching anything between the quotes.
+                  STMT="$(printf '%s' "$CURRENT_STMT" \
+                    | sed -e '$ s/[[:space:]]*;[[:space:]]*$//' \
+                          -e '1 s/^[[:space:]]*//' \
+                          -e '$ s/[[:space:]]*$//')"
+                  CURRENT_STMT=""
+                  [ -z "$STMT" ] && continue
+
+                  STMT_NUM=$((STMT_NUM + 1))
+                  echo "  Statement ${STMT_NUM}: $(printf '%s' "$STMT" | tr '\n' ' ' | head -c 80)..."
+
+                  if ! aws rds-data execute-statement \
+                      --resource-arn "${CLUSTER_ARN}" \
+                      --secret-arn   "${SECRET_ARN}" \
+                      --database     "${DB_NAME}" \
+                      ${TX_ARG} \
+                      --sql          "${STMT}" >/dev/null; then
+                    echo "✗ Migration '${FILENAME}' statement ${STMT_NUM} FAILED."
+                    if [ -n "${TX_ID}" ]; then
+                      echo "  Rolling back — nothing from this migration is applied."
+                      aws rds-data rollback-transaction \
+                        --resource-arn "${CLUSTER_ARN}" \
+                        --secret-arn   "${SECRET_ARN}" \
+                        --transaction-id "${TX_ID}" >/dev/null || true
+                    else
+                      echo "  ⚠️  This migration ran outside a transaction (CONCURRENTLY);"
+                      echo "     earlier statements in it are already committed."
+                    fi
+                    exit 1
+                  fi
+                  ;;
+              esac
             done < "${MIGRATION_FILE}"
 
-            # Record the applied version
-            aws rds-data execute-statement \
-              --resource-arn "${CLUSTER_ARN}" \
-              --secret-arn   "${SECRET_ARN}" \
-              --database     "${DB_NAME}" \
-              --sql          "INSERT INTO schema_migrations (version) VALUES (:version)" \
-              --parameters   "[{\"name\":\"version\",\"value\":{\"stringValue\":\"${VERSION}\"}}]"
+            # A migration that produced no statements has done nothing, and
+            # recording it as applied is worse than failing: the schema stops
+            # matching what schema_migrations claims, and nobody finds out until
+            # someone tries to rebuild the database from the repo.
+            #
+            # This is not hypothetical. 014-token-price-history.sql, 015-kyc.sql
+            # and 017-pool-betting.sql contain no statement terminators at all,
+            # so the previous parser found no semicolons, executed nothing, and
+            # recorded all three as applied. Their tables exist in production
+            # only because something other than the runner created them, and
+            # they are not in schema.sql either — so a rebuild from this repo
+            # would silently produce a different database.
+            if [ "${STMT_NUM}" -eq 0 ]; then
+              echo "✗ '${FILENAME}' produced no executable statements."
+              echo "  Every statement must be terminated with a semicolon."
+              echo "  Refusing to record it as applied."
+              if [ -n "${TX_ID}" ]; then
+                aws rds-data rollback-transaction \
+                  --resource-arn "${CLUSTER_ARN}" --secret-arn "${SECRET_ARN}" \
+                  --transaction-id "${TX_ID}" >/dev/null || true
+              fi
+              exit 1
+            fi
+
+            # Anything still buffered here never hit a terminator, so it was
+            # never executed. Silently dropping it is how a migration applies
+            # partially and still gets recorded as done — the failure mode this
+            # whole rewrite exists to remove. The commonest cause is a trailing
+            # comment after the semicolon, which leaves the line not ending in
+            # `;`:
+            #
+            #   CREATE TABLE t (id int);  -- set up for 019
+            #
+            # Put the comment on its own line above the statement.
+            LEFTOVER="$(printf '%s' "$CURRENT_STMT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [ -n "${LEFTOVER}" ]; then
+              echo "✗ '${FILENAME}' ends with an unterminated statement:"
+              printf '%s\n' "${LEFTOVER}" | head -3 | sed 's/^/    /'
+              echo "  Every statement must end in a semicolon, with nothing after it on that line."
+              if [ -n "${TX_ID}" ]; then
+                aws rds-data rollback-transaction \
+                  --resource-arn "${CLUSTER_ARN}" --secret-arn "${SECRET_ARN}" \
+                  --transaction-id "${TX_ID}" >/dev/null || true
+              fi
+              exit 1
+            fi
+
+            if [ "${DOLLAR_DEPTH}" -ne 0 ]; then
+              echo "✗ '${FILENAME}' ends inside an unterminated dollar-quoted block."
+              [ -n "${TX_ID}" ] && aws rds-data rollback-transaction \
+                --resource-arn "${CLUSTER_ARN}" --secret-arn "${SECRET_ARN}" \
+                --transaction-id "${TX_ID}" >/dev/null || true
+              exit 1
+            fi
+            # The version row is written inside the same transaction as the
+            # migration itself. Outside it, a commit that succeeded followed by a
+            # failed INSERT would leave the schema changed and the migration
+            # looking unapplied, so the next run would replay it.
+            if ! aws rds-data execute-statement \
+                --resource-arn "${CLUSTER_ARN}" \
+                --secret-arn   "${SECRET_ARN}" \
+                --database     "${DB_NAME}" \
+                ${TX_ARG} \
+                --sql          "INSERT INTO schema_migrations (version) VALUES (:version)" \
+                --parameters   "[{\"name\":\"version\",\"value\":{\"stringValue\":\"${VERSION}\"}}]" >/dev/null; then
+              echo "✗ Could not record version ${VERSION}."
+              if [ -n "${TX_ID}" ]; then
+                aws rds-data rollback-transaction \
+                  --resource-arn "${CLUSTER_ARN}" --secret-arn "${SECRET_ARN}" \
+                  --transaction-id "${TX_ID}" >/dev/null || true
+              fi
+              exit 1
+            fi
+
+            if [ -n "${TX_ID}" ]; then
+              COMMIT_STATUS=$(aws rds-data commit-transaction \
+                --resource-arn "${CLUSTER_ARN}" \
+                --secret-arn   "${SECRET_ARN}" \
+                --transaction-id "${TX_ID}" \
+                --query transactionStatus --output text 2>&1) || {
+                  echo "✗ Commit failed for '${FILENAME}': ${COMMIT_STATUS}"
+                  exit 1
+                }
+              echo "  Committed (${COMMIT_STATUS})"
+            fi
 
             echo "✓ Migration '${FILENAME}' applied successfully."
             APPLIED_COUNT=$((APPLIED_COUNT + 1))
