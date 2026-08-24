@@ -200,11 +200,13 @@ jobs:
                 esac
               fi
 
+              # Accumulate with an explicit newline. A literal newline inside
+              # the string would have to sit at column 0, which closes the YAML
+              # block scalar and breaks the workflow file.
               if [ -z "$CURRENT_STMT" ]; then
                 CURRENT_STMT="$LINE"
               else
-                CURRENT_STMT="${CURRENT_STMT}
-${LINE}"
+                CURRENT_STMT="${CURRENT_STMT}"$'\n'"$LINE"
               fi
 
               # Each unpaired $$ on a line flips in/out of a dollar-quoted body.
