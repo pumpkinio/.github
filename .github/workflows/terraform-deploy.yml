@@ -61,7 +61,7 @@ jobs:
 
     outputs:
       plan-has-changes: ${{ steps.plan.outputs.has-changes }}
-      plan-summary:     ${{ steps.plan.outputs.summary }}
+      plan-summary: ${{ steps.plan.outputs.summary }}
 
     steps:
       - name: Checkout repository
