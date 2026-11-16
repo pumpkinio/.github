@@ -124,15 +124,25 @@ jobs:
             echo "──────────────────────────────────────────"
             echo "Migration: ${FILENAME}  (version=${VERSION})"
 
-            # Check whether this version has already been applied
-            EXISTING=$(aws rds-data execute-statement \
-              --resource-arn "${CLUSTER_ARN}" \
-              --secret-arn   "${SECRET_ARN}" \
-              --database     "${DB_NAME}" \
-              --sql          "SELECT version FROM schema_migrations WHERE version = :version" \
-              --parameters   "[{\"name\":\"version\",\"value\":{\"stringValue\":\"${VERSION}\"}}]" \
-              --query        'records[0][0].stringValue' \
-              --output       text 2>/dev/null || true)
+            # A failed lookup must not read as "not applied": that replays the migration.
+            EXISTING=""
+            for ATTEMPT in 1 2 3 4 5; do
+              if EXISTING=$(aws rds-data execute-statement \
+                --resource-arn "${CLUSTER_ARN}" \
+                --secret-arn   "${SECRET_ARN}" \
+                --database     "${DB_NAME}" \
+                --sql          "SELECT version FROM schema_migrations WHERE version = :version" \
+                --parameters   "[{\"name\":\"version\",\"value\":{\"stringValue\":\"${VERSION}\"}}]" \
+                --query        'records[0][0].stringValue' \
+                --output       text 2>/tmp/migration-check.err); then
+                break
+              fi
+              if [ "${ATTEMPT}" -eq 5 ]; then
+                echo "✗ Could not check whether ${VERSION} is applied: $(cat /tmp/migration-check.err)"
+                exit 1
+              fi
+              sleep 5
+            done
 
             if [ "${EXISTING}" = "${VERSION}" ]; then
               echo "✓ Already applied — skipping."
