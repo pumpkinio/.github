@@ -82,7 +82,7 @@ jobs:
           cache: 'npm'
 
       - name: Install root dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Discover and deploy Lambda functions
         shell: bash
@@ -190,11 +190,13 @@ jobs:
                 elif [[ -f "$FUNCTIONS_DIR/package-lock.json" ]]; then
                   cp "$FUNCTIONS_DIR/package-lock.json" "$build_dir/package-lock.json"
                 fi
-                (cd "$build_dir" && npm install --omit=dev --no-audit --no-fund 2>&1 | tail -3)
+                (cd "$build_dir" && npm install --omit=dev --ignore-scripts --no-audit --no-fund 2>&1 | tail -3)
               fi
 
               # Package into zip
               (cd "$build_dir" && zip -qr "$zip_path" .)
+              # Each build holds its own node_modules; keeping all of them fills the runner disk.
+              rm -rf "$build_dir"
               ZIP_SIZE=$(du -sh "$zip_path" | cut -f1)
               echo "  Package: $ZIP_SIZE"
 
@@ -205,6 +207,7 @@ jobs:
                 --region "${{ inputs.aws-region }}" \
                 --output json \
                 | jq -r '"  CodeSize: \(.CodeSize) bytes"'
+              rm -f "$zip_path"
 
               aws lambda wait function-updated \
                 --function-name "$lambda_name" \
